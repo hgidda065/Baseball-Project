@@ -62,6 +62,12 @@ def edit_stats():
         else: break
     players[n-1]["ab"],players[n-1]["hits"]=ab,h
 
+def team_stats():
+    if not players: print("No players.\n"); return
+    total_ab=sum(p['ab'] for p in players)
+    total_h=sum(p['hits'] for p in players)
+    print(f"\nTeam Stats: {len(players)} players, Team AVG: {avg(total_h,total_ab):.3f}")
+
 
 today=date.today()
 print(LINE,"\nBaseball Team Manager".center(64),"\n"+LINE)
@@ -79,7 +85,7 @@ print(LINE)
 
 
 while True:
-    print("\n1 Display  2 Add  3 Remove  4 Move  5 Edit Pos  6 Edit Stats  7 Exit")
+    print("\n1 Display  2 Add  3 Remove  4 Move  5 Edit Pos  6 Edit Stats  7 Team Stats  8 Exit")
     c=input("Choice: ")
 
     if c=="1": show()
@@ -88,7 +94,8 @@ while True:
     elif c=="4": move()
     elif c=="5": edit_pos()
     elif c=="6": edit_stats()
-    elif c=="7":
+    elif c=="7": team_stats()
+    elif c=="8":
         save_players(players)
         print("Saved. Bye!")
         break
