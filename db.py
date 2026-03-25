@@ -3,11 +3,13 @@
 
 import csv
 import sqlite3
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from objects import Player
 
-DATABASE_PATH = "players.db"
-CSV_PATH = "players.csv"
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE_PATH = str(BASE_DIR / "players.db")
+CSV_PATH = str(BASE_DIR / "players.csv")
 DEFAULT_POSITIONS = ("C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "P")
 PLAYER_SELECT = """
     SELECT playerID, batOrder, firstName, lastName, position, atBats, hits
@@ -18,8 +20,9 @@ PLAYER_SELECT = """
 
 def _connect() -> sqlite3.Connection:
     """Open a SQLite connection with foreign keys enabled."""
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -48,35 +51,97 @@ def _ensure_position(cursor: sqlite3.Cursor, pos: Optional[str]) -> str:
     return normalized
 
 
+def _split_name(name: str) -> tuple[str, str]:
+    """Split full name into first and last name parts."""
+    cleaned = str(name).strip()
+    if not cleaned:
+        return "", ""
+    parts = cleaned.split(maxsplit=1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
+def _seed_players_from_csv_if_empty(cursor: sqlite3.Cursor) -> int:
+    """Import CSV players into Player table only when the table is empty."""
+    cursor.execute("SELECT COUNT(*) FROM Player")
+    if cursor.fetchone()[0] > 0:
+        return 0
+
+    seeded = 0
+    for idx, raw in enumerate(load_players(), start=1):
+        first, last = _split_name(raw.get("name", ""))
+        pos = _ensure_position(cursor, raw.get("position", ""))
+
+        try:
+            ab = int(raw.get("ab", 0))
+        except (TypeError, ValueError):
+            ab = 0
+
+        try:
+            hits = int(raw.get("hits", 0))
+        except (TypeError, ValueError):
+            hits = 0
+
+        ab = max(0, ab)
+        hits = max(0, min(hits, ab))
+
+        cursor.execute(
+            """
+            INSERT INTO Player(batOrder, firstName, lastName, position, atBats, hits)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (idx, first, last, pos, ab, hits),
+        )
+        seeded += 1
+
+    return seeded
+
+
 def init_db() -> None:
     """Create Position and Player tables (if needed) and seed default positions."""
     with _connect() as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Position (
-                position TEXT PRIMARY KEY
+
+        # Create schema if missing.
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Player'")
+        has_player_table = cur.fetchone() is not None
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Position'")
+        has_position_table = cur.fetchone() is not None
+        if not has_position_table:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS Position (
+                    position TEXT PRIMARY KEY
+                )
+                """
             )
-            """
-        )
-        cur.executemany(
-            "INSERT OR IGNORE INTO Position(position) VALUES(?)",
-            ((p,) for p in DEFAULT_POSITIONS),
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS Player (
-                playerID INTEGER PRIMARY KEY AUTOINCREMENT,
-                batOrder INTEGER,
-                firstName TEXT,
-                lastName TEXT,
-                position TEXT,
-                atBats INTEGER,
-                hits INTEGER,
-                FOREIGN KEY(position) REFERENCES Position(position)
+        if not has_player_table:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS Player (
+                    playerID INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batOrder INTEGER,
+                    firstName TEXT,
+                    lastName TEXT,
+                    position TEXT,
+                    atBats INTEGER,
+                    hits INTEGER,
+                    FOREIGN KEY(position) REFERENCES Position(position)
+                )
+                """
             )
-            """
-        )
+
+        cur.execute("SELECT COUNT(*) FROM Position")
+        position_count = cur.fetchone()[0]
+        if position_count == 0:
+            cur.executemany(
+                "INSERT OR IGNORE INTO Position(position) VALUES(?)",
+                ((p,) for p in DEFAULT_POSITIONS),
+            )
+
+        _seed_players_from_csv_if_empty(cur)
+
         conn.commit()
 
 
@@ -247,7 +312,7 @@ def load_players() -> List[Dict]:
 
 
 def save_players(players: List[Dict]) -> None:
-    """Write players to CSV with keys: name, position, ab, hits."""
+    """Write players to CSV and synchronize the SQLite Player table."""
     with open(CSV_PATH, "w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=["name", "position", "ab", "hits"])
         writer.writeheader()
@@ -260,3 +325,35 @@ def save_players(players: List[Dict]) -> None:
                     "hits": int(player.get("hits", 0)),
                 }
             )
+
+    # Keep GUI and console apps in sync by reflecting CSV changes into SQLite.
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM Player")
+        for idx, raw in enumerate(players, start=1):
+            first, last = _split_name(raw.get("name", ""))
+            pos = _ensure_position(cur, raw.get("position", ""))
+
+            try:
+                ab = int(raw.get("ab", 0))
+            except (TypeError, ValueError):
+                ab = 0
+
+            try:
+                hits = int(raw.get("hits", 0))
+            except (TypeError, ValueError):
+                hits = 0
+
+            ab = max(0, ab)
+            hits = max(0, min(hits, ab))
+
+            cur.execute(
+                """
+                INSERT INTO Player(batOrder, firstName, lastName, position, atBats, hits)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (idx, first, last, pos, ab, hits),
+            )
+
+        conn.commit()
