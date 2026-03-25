@@ -1,153 +1,262 @@
-# db.py - Database operations for player data persistence
-# Handles SQLite database and CSV file operations
+# db.py
+# Database and CSV helpers for persisting player data.
 
-import sqlite3
 import csv
+import sqlite3
+from typing import Any, Dict, List, Optional
 from objects import Player
 
-# File paths for data storage
-database = "players.db"  # SQLite database file
-csvfile = "players.csv"  # CSV backup file
+DATABASE_PATH = "players.db"
+CSV_PATH = "players.csv"
+DEFAULT_POSITIONS = ("C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "P")
+PLAYER_SELECT = """
+    SELECT playerID, batOrder, firstName, lastName, position, atBats, hits
+    FROM Player
+    ORDER BY batOrder, playerID
+"""
 
-def connect():
-    """Creates and returns a connection to the SQLite database."""
-    conn = sqlite3.connect(database)
+
+def _connect() -> sqlite3.Connection:
+    """Open a SQLite connection with foreign keys enabled."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
-def init_db():
-    """
-    Initializes the database by creating the Player table if it doesn't exist.
-    Called at startup to ensure the database schema is ready.
-    """
-    conn = connect()
-    cursor = conn.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS Player (playerID INTEGER PRIMARY KEY AUTOINCREMENT, batOrder INTEGER, firstName TEXT, lastName TEXT, position TEXT, atBats INTEGER, hits INTEGER)")
-    conn.commit()
-    conn.close()
 
-def load(lineup):
+def _normalize_position(pos: Optional[str]) -> str:
+    """Normalize position value for storage (uppercased, stripped)."""
+    if pos is None:
+        return ""
+    return str(pos).strip().upper()
+
+
+def _row_to_player(row: tuple) -> Player:
+    """Convert a database row to a Player instance."""
+    return Player(row[0], row[1], row[2], row[3], row[4], row[5], row[6])
+
+
+def _next_bat_order(cursor: sqlite3.Cursor) -> int:
+    """Return the next batting order (max existing + 1)."""
+    cursor.execute("SELECT COALESCE(MAX(batOrder), 0) + 1 FROM Player")
+    return cursor.fetchone()[0]
+
+
+def _ensure_position(cursor: sqlite3.Cursor, pos: Optional[str]) -> str:
+    """Ensure the position exists in the Position table and return normalized value."""
+    normalized = _normalize_position(pos)
+    cursor.execute("INSERT OR IGNORE INTO Position(position) VALUES(?)", (normalized,))
+    return normalized
+
+
+def init_db() -> None:
+    """Create Position and Player tables (if needed) and seed default positions."""
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS Position (
+                position TEXT PRIMARY KEY
+            )
+            """
+        )
+        cur.executemany(
+            "INSERT OR IGNORE INTO Position(position) VALUES(?)",
+            ((p,) for p in DEFAULT_POSITIONS),
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS Player (
+                playerID INTEGER PRIMARY KEY AUTOINCREMENT,
+                batOrder INTEGER,
+                firstName TEXT,
+                lastName TEXT,
+                position TEXT,
+                atBats INTEGER,
+                hits INTEGER,
+                FOREIGN KEY(position) REFERENCES Position(position)
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_all() -> List[Player]:
+    """Return all players sorted by batting order then playerID."""
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute(PLAYER_SELECT)
+        rows = cur.fetchall()
+    return [_row_to_player(r) for r in rows]
+
+
+def read_all_players() -> List[Player]:
+    """Alias for get_all to support alternate API naming."""
+    return get_all()
+
+
+def add(player: Player) -> int:
     """
-    Loads all players from the database into the provided Lineup object.
-    Players are sorted by their batting order position.
+    Insert a new player record and return the assigned player ID.
+    If player.order is falsy, assign the next available batting order.
     """
     init_db()
-    conn = connect()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM Player ORDER BY batOrder")
-    rows = cursor.fetchall()
-    # Convert each database row into a Player object
-    for row in rows:
-        player_id = row[0]
-        bat_order = row[1]
-        first_name = row[2]
-        last_name = row[3]
-        position = row[4]
-        at_bats = row[5]
-        hits = row[6]
-        p = Player(player_id, bat_order, first_name, last_name, position, at_bats, hits)
-        lineup.add(p)
-    conn.close()
+    with _connect() as conn:
+        cur = conn.cursor()
+        pos = _ensure_position(cur, player.pos)
+        bat_order = player.order if player.order and player.order > 0 else _next_bat_order(cur)
+        cur.execute(
+            """
+            INSERT INTO Player(batOrder, firstName, lastName, position, atBats, hits)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (bat_order, player.first, player.last, pos, player.ab, player.hits),
+        )
+        player.id = cur.lastrowid
+        player.order = bat_order
+        player.pos = pos
+        conn.commit()
+    return player.id
 
-def save(lineup):
-    """
-    Saves the entire lineup to the database.
-    Clears existing data and inserts all players with updated batting order.
-    """
-    conn = connect()
-    cursor = conn.cursor()
-    # Clear existing players - we'll re-insert with current order
-    cursor.execute("DELETE FROM Player")
-    counter = 1
-    for p in lineup.players:
-        cursor.execute("INSERT INTO Player(batOrder,firstName,lastName,position,atBats,hits) VALUES(?,?,?,?,?,?)", (counter, p.first, p.last, p.pos, p.ab, p.hits))
-        counter = counter + 1
-    conn.commit()
-    conn.close()
 
-def load_players():
+def add_player(player: Player) -> int:
+    """Alias for add to support alternate API naming."""
+    return add(player)
+
+
+def update(player: Player) -> None:
+    """Update an existing player identified by player.id."""
+    if player.id is None:
+        raise ValueError("player.id must be set to update a record")
+
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        pos = _ensure_position(cur, player.pos)
+        cur.execute(
+            """
+            UPDATE Player
+            SET firstName = ?,
+                lastName  = ?,
+                position  = ?,
+                atBats    = ?,
+                hits      = ?
+            WHERE playerID = ?
+            """,
+            (player.first, player.last, pos, player.ab, player.hits, player.id),
+        )
+        conn.commit()
+    player.pos = pos
+
+
+def update_player(player: Player) -> None:
+    """Alias for update to support alternate API naming."""
+    update(player)
+
+
+def delete(player_id: int) -> None:
+    """Permanently remove a player by playerID."""
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM Player WHERE playerID = ?", (player_id,))
+        conn.commit()
+
+
+def delete_player(player_id: int) -> None:
+    """Alias for delete to support alternate API naming."""
+    delete(player_id)
+
+
+def update_batting_order(players: List[Player]) -> None:
     """
-    Loads player data from the CSV file.
-    Returns a list of player dictionaries.
-    Used as an alternative to database storage.
+    Update batOrder for each player in the provided list to match list order.
+    Players must have valid player.id values.
+    """
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        for idx, player in enumerate(players, start=1):
+            if player.id is None:
+                raise ValueError("All players must have an id to update batting order")
+            cur.execute("UPDATE Player SET batOrder = ? WHERE playerID = ?", (idx, player.id))
+            player.order = idx
+        conn.commit()
+
+
+def update_all_batting_orders(players: List[Player]) -> None:
+    """Alias for update_batting_order to support alternate API naming."""
+    update_batting_order(players)
+
+
+def load(lineup: Any) -> None:
+    """Populate the supplied Lineup object from the database."""
+    lineup.players = []
+    for player in get_all():
+        lineup.add(player)
+
+
+def save(lineup: Any) -> None:
+    """
+    Replace all Player rows with lineup.players.
+    Batting order is set from each player's list position.
+    """
+    init_db()
+    with _connect() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM Player")
+        for idx, player in enumerate(lineup.players, start=1):
+            pos = _ensure_position(cur, player.pos)
+            cur.execute(
+                """
+                INSERT INTO Player(batOrder, firstName, lastName, position, atBats, hits)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (idx, player.first, player.last, pos, player.ab, player.hits),
+            )
+            player.id = cur.lastrowid
+            player.order = idx
+            player.pos = pos
+        conn.commit()
+
+
+def load_players() -> List[Dict]:
+    """
+    Read players from CSV with header: name,position,ab,hits.
+    Returns list of dicts; malformed rows are skipped.
     """
     try:
-        player_list = []
-        file = open(csvfile, 'r')
-        lines = file.readlines()
-        file.close()
-        # Skip header line (index 0) and process data rows
-        if len(lines) > 0:
-            for i in range(1, len(lines)):
-                line = lines[i]
-                line = line.strip()
-                parts = line.split(',')
-                # Validate that we have all 4 expected fields
-                if len(parts) == 4:
-                    player_dict = {}
-                    player_dict['name'] = parts[0]
-                    player_dict['position'] = parts[1]
-                    player_dict['ab'] = int(parts[2])
-                    player_dict['hits'] = int(parts[3])
-                    player_list.append(player_dict)
-        return player_list
-    except:
-        # Return empty list if file doesn't exist or has errors
+        with open(CSV_PATH, "r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            players = []
+            for row in reader:
+                try:
+                    players.append(
+                        {
+                            "name": str(row.get("name", "")).strip(),
+                            "position": str(row.get("position", "")).strip(),
+                            "ab": int(row.get("ab", 0)),
+                            "hits": int(row.get("hits", 0)),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    continue
+            return players
+    except FileNotFoundError:
         return []
 
-def save_players(players):
-    """
-    Saves player data to the CSV file.
-    Creates a header row followed by one row per player.
-    """
-    file = open(csvfile, 'w')
-    file.write('name,position,ab,hits\n')  # CSV header
-    for player in players:
-        line = player['name'] + ',' + player['position'] + ',' + str(player['ab']) + ',' + str(player['hits']) + '\n'
-        file.write(line)
-    file.close()
 
-def get_all():
-    """
-    Retrieves all players from the database.
-    Returns a list of Player objects sorted by batting order.
-    """
-    conn = connect()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM Player ORDER BY batOrder")
-    rows = cursor.fetchall()
-    player_list = []
-    # Convert database rows to Player objects
-    for row in rows:
-        player_id = row[0]
-        bat_order = row[1]
-        first_name = row[2]
-        last_name = row[3]
-        position = row[4]
-        at_bats = row[5]
-        hits = row[6]
-        p = Player(player_id, bat_order, first_name, last_name, position, at_bats, hits)
-        player_list.append(p)
-    conn.close()
-    return player_list
-
-def update(player):
-    """
-    Updates an existing player record in the database.
-    Uses the player's ID to identify which record to update.
-    """
-    conn = connect()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE Player SET firstName=?, lastName=?, position=?, atBats=?, hits=? WHERE playerID=?", (player.first, player.last, player.pos, player.ab, player.hits, player.id))
-    conn.commit()
-    conn.close()
-
-def delete(player_id):
-    """
-    Removes a player from the database by their ID.
-    This action is permanent and cannot be undone.
-    """
-    conn = connect()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM Player WHERE playerID=?", (player_id,))
-    conn.commit()
-    conn.close()
+def save_players(players: List[Dict]) -> None:
+    """Write players to CSV with keys: name, position, ab, hits."""
+    with open(CSV_PATH, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["name", "position", "ab", "hits"])
+        writer.writeheader()
+        for player in players:
+            writer.writerow(
+                {
+                    "name": str(player.get("name", "")).replace("\n", " "),
+                    "position": str(player.get("position", "")).replace("\n", " "),
+                    "ab": int(player.get("ab", 0)),
+                    "hits": int(player.get("hits", 0)),
+                }
+            )
